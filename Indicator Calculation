@@ -1,0 +1,231 @@
+import pandas as pd
+import json
+
+ts='ts'
+request_id='request_id'
+scenario='scenario'
+is_refusal='is_refusal'
+output_text='output_text'
+user_vote='user_vote'
+refusal_reason='refusal_reason'
+latency_ms='latency_ms'
+reason_code=['RISK_KEYWORD','SELF_HARM','ILLEGAL','POLICY','OTHER']
+reason_scene=['general_qa','coding','travel','medical','finance']
+output_len='output_len'
+
+df_path = 'logs_v1.csv'
+
+df = pd.read_csv(df_path)
+
+
+with open('config.json','r') as con:
+    con_read=json.load(con)
+
+bad_latency_threshold_ms=con_read['bad_latency_threshold_ms']
+short_output_threshold_chars=con_read['short_output_threshold_chars']
+topn=con_read['topn']
+
+
+#-------1)处理数据
+def load_and_clean(df):
+    #填充空值之后的表格
+    df = compute_overall(df)
+
+    #按时间排序并去重后表格
+    # request_id 去重：同一请求可能重试，按 ts 保留最后一条作为最终结果
+    df[ts] = pd.to_datetime(df[ts], errors="coerce") #把 ts 转成 datetime
+    df = df.sort_values(by=ts).drop_duplicates(subset=[request_id],keep='last')  
+
+    #latency_ms 为空填中位数，latency_ms 为负 处理成空值然后也填中位数
+    # 用中位数填充延迟缺失/异常：对极端值更鲁棒，不被少量超大延迟拉偏
+    df[latency_ms] = pd.to_numeric(df[latency_ms], errors="coerce")  #处理格式，把单元格所有格式统一为数字，处理不了就变成空值
+    df.loc[df[latency_ms] < 0, latency_ms] = pd.NA   #单元格小于零，填空值
+    df[latency_ms] = df[latency_ms].fillna(df[latency_ms].median())    #把所有空值列填中位数
+
+    #计算文本字数并填充到新列
+    df['output_len'] = df[output_text].fillna("").astype(str).str.len()
+
+
+    return df
+
+
+#-------2)填充空值
+def compute_overall(df):
+    df[scenario] = df[scenario].fillna("unknown")
+    df[is_refusal] = df[is_refusal].fillna(0).astype(int)
+    df[output_text] = df[output_text].fillna("")
+    df[user_vote] = df[user_vote].fillna(0).astype(int)
+    df[refusal_reason] = df[refusal_reason].fillna("NONE")
+
+    return df
+
+
+#-------3)总体指标
+def overall_indicators(df,version): 
+    """
+    total_requests: 去重后的请求数，后续所有比例指标默认以此为分母
+    """
+    
+    #去重后总行数
+    total=df.shape[0]
+
+    #拒答率平均值
+    df_refusal_rate = df[is_refusal].mean()
+
+    #延迟毫秒平均值和文本长度平均值
+    avg_latency_ms = df[latency_ms].mean()
+    avg_output_len = df['output_len'].mean()
+
+    #延迟毫秒的50分位数和90分位数
+    p50_latency_ms = df[latency_ms].median()
+    p90_latency_ms = df[latency_ms].quantile(0.9)
+    
+    #文本长度的50分位数和90分位数
+    p50_output_len = df['output_len'].median()
+    p90_output_len = df['output_len'].quantile(0.9)
+    
+    #点赞率
+    df_like_rate = (df[user_vote] == 1).mean()
+
+    #点踩率
+    df_dislike_rate = (df[user_vote] == -1).mean()
+
+
+    return {
+        "version": version,
+        "total_requests": total,
+        "refusal_rate": df_refusal_rate,
+        "avg_latency_ms": avg_latency_ms,
+        "p50_latency_ms": p50_latency_ms,
+        "p90_latency_ms": p90_latency_ms,
+        "avg_output_len": avg_output_len,
+        "p50_output_len": p50_output_len,
+        "p90_output_len": p90_output_len,
+        "like_rate": df_like_rate,
+        "dislike_rate": df_dislike_rate,
+    }
+
+
+#-------4)按 refusal_reason 分桶统计并对比
+def refusal_reason_bin(df):
+    """
+    拒答原因码，如 RISK_KEYWORD / SELF_HARM / ILLEGAL / POLICY / OTHER
+
+    分子为确定拒答&具体某个拒答原因的数量；分母为按request_id去重后表格行数
+    """
+
+    df_total = df.shape[0] #去重后表格行数
+    df_refusal_count=[]
+    df_refusal_rate=[]
+
+    #确定拒答且有原因码的前提下，每种原因的数量、占比
+    for i in reason_code:
+        tmp = df[(df[refusal_reason] == i) & (df[is_refusal]==1)] 
+        count = tmp.shape[0]
+        df_refusal_count.append(count)  #数量
+        rate=count/df_total
+        df_refusal_rate.append(rate)  #占比
+
+    return {
+        "reason_code": reason_code,
+        'refusal_count':df_refusal_count,
+        'refusal_rate':df_refusal_rate,
+    }
+
+
+#-------5)按 scenario 分桶,找“退化最明显”的场景 TopN
+def scenario_bin(df):
+    """
+    对话场景，如 'general_qa','coding','travel','medical','finance'
+    
+    分子为具体某一场景下拒答、点踩数量；分母为具体某一场景总数
+    """
+
+    refusal_rate_scene=[]
+    dislike=[]
+    avg_latency=[]
+
+    #每种对话场景下，不同场景数量、不同场景拒答率、不同场景点踩率、不同场景平均延迟毫秒
+    for i in reason_scene:
+        #不同场景数量
+        df_scene=df[df[scenario] == i]
+        df_scene_count=df_scene.shape[0]
+
+        #不同场景拒答率
+        df_refusal_count = df_scene[df_scene[is_refusal] == 1].shape[0]
+        df_refusal_rate = df_refusal_count/df_scene_count
+        refusal_rate_scene.append(df_refusal_rate)
+
+        #不同场景点踩率
+        df_dislike_count = df_scene[df_scene[user_vote] == -1].shape[0]
+        df_dislike_rate=df_dislike_count/df_scene_count
+        dislike.append(df_dislike_rate)
+
+        #不同场景平均延迟毫秒
+        avg_latency_ms=df_scene[latency_ms].mean() 
+        avg_latency.append(avg_latency_ms)
+
+
+    return {
+        "scenario_list": reason_scene,
+        'refusal_rate_scene':refusal_rate_scene,
+        'dislike':dislike,
+        'avg_latency':avg_latency,
+    }
+
+
+#-------6)抽取“疑似误拒/体验差”的样本
+def bad_cases_sample(df):
+    """
+    bad cases 用于人工复核：定位误拒、慢请求、短回答（疑似敷衍/答非所问）
+    """
+
+    #拒答且原因为高风险关键词的样本
+    refusal_match = df[(df[is_refusal] == 1) & (df[refusal_reason] == "RISK_KEYWORD")]
+    topn_rufusal=refusal_match.sort_values(ts,ascending=False).head(50) 
+    
+    #延迟毫秒大于阈值的样本
+    latency_match = df[df[latency_ms] >= bad_latency_threshold_ms]
+    topn_lantency=latency_match.sort_values(ts,ascending=False).head(50)
+
+    #文本长度小于阈值且未拒答的样本
+    output_match = df[(df[output_len] <= short_output_threshold_chars) & (df[is_refusal] == 0)] 
+    topn_output=output_match.sort_values(ts,ascending=False).head(50)
+
+
+    return {
+        'topn_rufusal':topn_rufusal,
+        'topn_lantency':topn_lantency,
+        'topn_output':topn_output,
+    }
+
+
+
+#-------7)两版数据对比
+def compare(v1,v2):
+
+    #按拒答原因划分，拒答率对比   
+    v1_reason_rate = refusal_reason_bin(v1)["refusal_rate"]
+    v2_reason_rate = refusal_reason_bin(v2)["refusal_rate"]
+    delta_reason_refusal = pd.Series(v2_reason_rate) - pd.Series(v1_reason_rate)
+
+    #按对话场景划分，取版本数据
+    v1_s = scenario_bin(v1)
+    v2_s = scenario_bin(v2)
+
+        #拒答率对比
+    delta_scene_refusal = pd.Series(v2_s["refusal_rate_scene"]) - pd.Series(v1_s["refusal_rate_scene"])
+
+        #点踩率对比
+    delta_dislike_rate = pd.Series(v2_s["dislike"]) - pd.Series(v1_s["dislike"])
+
+        #延迟毫秒对比
+    delta_latency_ms = pd.Series(v2_s["avg_latency"]) - pd.Series(v1_s["avg_latency"]) 
+
+
+    return {
+        'delta_reason_refusal':delta_reason_refusal,
+        'delta_scene_refusal':delta_scene_refusal,
+        'delta_dislike_rate':delta_dislike_rate,
+        'delta_latency_ms':delta_latency_ms,
+    }
